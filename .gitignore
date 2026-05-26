@@ -1,0 +1,28 @@
+# 敏感配置（含 API key）
+config.json
+
+# 日志
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# 项目无关文档
+docs/
+linux-do-key-harvest.md
+AGENTS.md

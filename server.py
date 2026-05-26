@@ -1,0 +1,365 @@
+import asyncio
+import json
+import logging
+import time
+import warnings
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
+from mimo_core import CONFIG_PATH, load_config, probe_key, code_to_status, update_key_status
+
+warnings.filterwarnings('ignore', message='Unclosed client session')
+warnings.filterwarnings('ignore', message='Unclosed connector')
+
+LOG_DIR = Path(__file__).parent
+LOG_MAX_DAYS = 2
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(LOG_DIR / 'mimo-router.log', maxBytes=10*1024*1024, backupCount=3, encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+logging.getLogger('aiohttp').setLevel(logging.WARNING)
+
+
+def cleanup_old_logs():
+    log_file = LOG_DIR / 'mimo-router.log'
+    if not log_file.exists():
+        return
+    cutoff = datetime.now() - timedelta(days=LOG_MAX_DAYS)
+    cutoff_str = cutoff.strftime('%Y-%m-%d')
+    kept, dropped = [], 0
+    with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            # 日志格式: [2026-05-26 00:00:00,000]
+            if line.startswith('[') and len(line) > 11:
+                date_str = line[1:11]
+                if date_str < cutoff_str:
+                    dropped += 1
+                    continue
+            kept.append(line)
+    if dropped:
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.writelines(kept)
+        logger.info(f"已清理 {dropped} 条过期日志 (早于 {cutoff_str})")
+
+
+class MimoRoute:
+    _REQ_SKIP = frozenset({'host', 'content-length', 'transfer-encoding', 'connection'})
+    _RESP_SKIP = frozenset({'transfer-encoding', 'connection', 'content-encoding'})
+
+    def __init__(self):
+        self.config = load_config()
+        self.last_modified = 0
+        self._session: ClientSession | None = None
+        self._key_index = 0
+        self._last_error_permanent = False
+        self._last_cn_valid = -1
+        self._last_sgp_valid = -1
+        self._cached_keys: tuple[list[dict], list[dict]] | None = None
+        self._config_check_time = 0.0
+        self._config_check_interval = 2.0
+        self._endpoint_down: dict[str, float] = {}  # endpoint_url -> last 404 time
+        self._endpoint_cooldown = 10.0  # 404 后冷却秒数
+
+    async def _get_session(self) -> ClientSession:
+        if self._session is None or self._session.closed:
+            connector = TCPConnector(limit=100, ttl_dns_cache=300, keepalive_timeout=30)
+            self._session = ClientSession(connector=connector)
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    def _load_config(self) -> dict:
+        try:
+            config = load_config()
+            cn_total = len(config['apikeys'].get('cn', []))
+            sgp_total = len(config['apikeys'].get('sgp', []))
+            cn_valid = sum(1 for k in config['apikeys'].get('cn', []) if isinstance(k, dict) and k.get('status') not in ('invalid', 'disabled', 'quota_exhausted', 'error'))
+            sgp_valid = sum(1 for k in config['apikeys'].get('sgp', []) if isinstance(k, dict) and k.get('status') not in ('invalid', 'disabled', 'quota_exhausted', 'error'))
+            logger.info(f"配置加载成功，cn: {cn_valid}/{cn_total}可用，sgp: {sgp_valid}/{sgp_total}可用，共 {cn_valid+sgp_valid} 个可用")
+            return config
+        except Exception as e:
+            logger.error(f"配置加载失败: {e}")
+            return {"apikeys": {"cn": [], "sgp": []}, "local_key": "123", "port": 18888, "endpoints": {"cn": "", "sgp": ""}}
+
+    def _invalidate_config_cache(self):
+        self._cached_keys = None
+        self._config_check_time = 0
+
+    def _check_config_update(self):
+        now = time.monotonic()
+        if now - self._config_check_time < self._config_check_interval:
+            return
+        self._config_check_time = now
+        try:
+            mtime = CONFIG_PATH.stat().st_mtime
+            if mtime > self.last_modified:
+                self.config = self._load_config()
+                self.last_modified = mtime
+                self._key_index = 0
+                self._cached_keys = None
+                logger.info("配置已热更新")
+        except Exception as e:
+            logger.warning(f"检查配置更新失败: {e}")
+
+    def _get_all_keys(self) -> tuple[list[dict], list[dict]]:
+        """返回 (valid_keys, recovery_keys)，valid 优先，带缓存"""
+        if self._cached_keys is not None:
+            return self._cached_keys
+        valid, recovery = [], []
+        for endpoint, key_list in self.config['apikeys'].items():
+            for k in key_list:
+                if not isinstance(k, dict):
+                    continue
+                entry = {'endpoint': endpoint, 'key': k['key'], 'status': k.get('status', 'valid')}
+                if k.get('status') in ('invalid', 'quota_exhausted'):
+                    recovery.append(entry)
+                elif k.get('status') not in ('disabled', 'error'):
+                    valid.append(entry)
+        self._cached_keys = (valid, recovery)
+        return valid, recovery
+
+    def _invalidate_key(self, key: str, endpoint: str, error_code: int, error_message: str):
+        """标记 key 失效，线程池执行"""
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, self._invalidate_key_sync, key, endpoint, error_code, error_message)
+
+    def _invalidate_key_sync(self, key: str, endpoint: str, error_code: int, error_message: str):
+        if update_key_status(key, 'invalid', error_code, error_message):
+            logger.warning(f"key {key[:16]}... 已失效 (endpoint: {endpoint}, code: {error_code})")
+            self.config = load_config()
+            self._invalidate_config_cache()
+
+    def _recover_key(self, key: str):
+        """恢复 key 为 valid，线程池执行"""
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, self._recover_key_sync, key)
+
+    def _recover_key_sync(self, key: str):
+        if update_key_status(key, 'valid'):
+            logger.info(f"key {key[:16]}... 已恢复")
+            self.config = load_config()
+            self._invalidate_config_cache()
+
+    async def _forward(self, session: ClientSession, request: web.Request, body: bytes, key: str, endpoint_url: str):
+        """转发请求，返回 StreamResponse=成功，None=需要重试"""
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in self._REQ_SKIP}
+        headers['Authorization'] = f'Bearer {key}'
+        path = request.path
+        if path.startswith('/v1/models'):
+            target_url = f'{endpoint_url}{path}'
+        elif not path.startswith('/anthropic'):
+            target_url = f'{endpoint_url}/anthropic{path}'
+        else:
+            target_url = f'{endpoint_url}{path}'
+
+        try:
+            start = time.time()
+            async with session.request(
+                method=request.method, url=target_url, headers=headers,
+                data=body, timeout=ClientTimeout(total=300)
+            ) as resp:
+                api_ver = headers.get('anthropic-version', 'none')
+
+                if resp.status != 200:
+                    resp_body = await resp.read()
+                    latency = int((time.time() - start) * 1000)
+                    error_body = resp_body.decode('utf-8', errors='ignore')[:200]
+                    logger.info(f"key={key[:8]}... endpoint={endpoint_url} status={resp.status} latency={latency}ms error={error_body} anthropic-version={api_ver}")
+
+                    if resp.status in (401, 402, 403, 429):
+                        self._invalidate_key(key, endpoint_url, resp.status, error_body)
+                        self._last_error_permanent = True
+                    else:
+                        self._last_error_permanent = False
+                        if resp.status == 404:
+                            self._endpoint_down[endpoint_url] = time.monotonic()
+                    return None
+
+                resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in self._RESP_SKIP}
+                resp_headers['Access-Control-Allow-Origin'] = '*'
+                stream = web.StreamResponse(status=resp.status, headers=resp_headers)
+                await stream.prepare(request)
+
+                first_chunk = True
+                async for chunk in resp.content.iter_any():
+                    if first_chunk:
+                        latency = int((time.time() - start) * 1000)
+                        logger.info(f"key={key[:8]}... endpoint={endpoint_url} status=200 latency={latency}ms anthropic-version={api_ver}")
+                        self._endpoint_down.pop(endpoint_url, None)
+                        first_chunk = False
+                    await stream.write(chunk)
+
+                await stream.write_eof()
+                return stream
+        except Exception as e:
+            logger.error(f"转发失败: {e}")
+            self._last_error_permanent = False
+            return None
+
+    async def _refresh_keys(self):
+        """后台探测所有 key 状态，并行执行"""
+        endpoints = self.config.get('endpoints', {})
+        keys_snapshot = [
+            (ep, k['key'])
+            for ep, key_list in self.config.get('apikeys', {}).items()
+            if endpoints.get(ep)
+            for k in key_list
+            if isinstance(k, dict) and k.get('status') != 'disabled'
+        ]
+        if not keys_snapshot:
+            return
+
+        session = await self._get_session()
+
+        async def probe(ep, key):
+            code, error_body = await probe_key(session, key, endpoints[ep])
+            return ep, key, code, error_body
+
+        results = await asyncio.gather(*(probe(ep, key) for ep, key in keys_snapshot))
+        for ep, key, code, error_body in results:
+            status = code_to_status(code, error_body)
+            if status is not None:
+                if update_key_status(key, status, code if code > 0 else 0, error_body):
+                    logger.info(f"key {key[:16]}... 状态更新为 {status} (endpoint: {ep})")
+
+        self.config = load_config()
+        self._invalidate_config_cache()
+        cn_valid = sum(1 for k in self.config['apikeys'].get('cn', []) if isinstance(k, dict) and k.get('status') == 'valid')
+        sgp_valid = sum(1 for k in self.config['apikeys'].get('sgp', []) if isinstance(k, dict) and k.get('status') == 'valid')
+        if cn_valid != self._last_cn_valid or sgp_valid != self._last_sgp_valid:
+            logger.info(f"key 刷新完成，cn: {cn_valid} 可用，sgp: {sgp_valid} 可用")
+            self._last_cn_valid = cn_valid
+            self._last_sgp_valid = sgp_valid
+
+    async def _background_refresh(self, app: web.Application):
+        """启动时立即刷新，之后每 30 秒轮询"""
+        await self._refresh_keys()
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self._refresh_keys()
+            except Exception as e:
+                logger.error(f"后台刷新异常: {e}")
+
+    async def handle_request(self, request: web.Request):
+        if request.method == 'OPTIONS':
+            return web.Response(
+                status=204,
+                headers={
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                    'Access-Control-Allow-Headers': '*',
+                    'Access-Control-Max-Age': '86400',
+                }
+            )
+        session = await self._get_session()
+        body = await request.read()
+        self._check_config_update()
+
+        if request.content_type == 'application/json' and body:
+            try:
+                data = json.loads(body)
+                model = data.get('model', '')
+                modified = False
+
+                if modified:
+                    body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+        valid_keys, recovery_keys = self._get_all_keys()
+        if not valid_keys and not recovery_keys:
+            logger.error("所有key不可用")
+            return web.Response(status=503, text=json.dumps({'error': 'All keys exhausted'}), content_type='application/json',
+                                headers={'Access-Control-Allow-Origin': '*'})
+
+        n = len(valid_keys)
+        now = time.monotonic()
+        had_endpoint_error = False
+        for i in range(n):
+            idx = (self._key_index + i) % n
+            info = valid_keys[idx]
+            endpoint_url = self.config['endpoints'].get(info['endpoint'])
+            if not endpoint_url:
+                continue
+            # 端点冷却中，跳过
+            down_since = self._endpoint_down.get(endpoint_url)
+            if down_since and now - down_since < self._endpoint_cooldown:
+                continue
+            resp = await self._forward(session, request, body, info['key'], endpoint_url)
+            if resp is not None:
+                self._key_index = (idx + 1) % n
+                return resp
+            if not self._last_error_permanent:
+                had_endpoint_error = True
+                break
+
+        # 端点错误等冷却结束后重试
+        if had_endpoint_error:
+            for ep_url, down_time in list(self._endpoint_down.items()):
+                remaining = self._endpoint_cooldown - (now - down_time)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    break
+            for i in range(n):
+                idx = (self._key_index + i) % n
+                info = valid_keys[idx]
+                endpoint_url = self.config['endpoints'].get(info['endpoint'])
+                if not endpoint_url:
+                    continue
+                resp = await self._forward(session, request, body, info['key'], endpoint_url)
+                if resp is not None:
+                    self._key_index = (idx + 1) % n
+                    return resp
+
+        for info in recovery_keys:
+            endpoint_url = self.config['endpoints'].get(info['endpoint'])
+            if not endpoint_url:
+                continue
+            resp = await self._forward(session, request, body, info['key'], endpoint_url)
+            if resp is not None:
+                self._recover_key(info['key'])
+                return resp
+
+        logger.error("所有key不可用")
+        return web.Response(status=503, text=json.dumps({'error': 'All keys exhausted'}), content_type='application/json',
+                            headers={'Access-Control-Allow-Origin': '*'})
+
+
+def create_app():
+    route = MimoRoute()
+    app = web.Application()
+
+    async def on_startup(app):
+        app['refresh_task'] = asyncio.create_task(route._background_refresh(app))
+
+    async def on_cleanup(app):
+        task = app.get('refresh_task')
+        if task:
+            task.cancel()
+        await route.close()
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    app.router.add_route('*', '/{path:.*}', route.handle_request)
+    return app
+
+
+if __name__ == '__main__':
+    cleanup_old_logs()
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            port = json.load(f).get('port', 18888)
+    except Exception:
+        port = 18888
+    logger.info(f"启动 MimoRoute，端口: {port}")
+    web.run_app(create_app(), host='0.0.0.0', port=port)

@@ -1,0 +1,22 @@
+{
+  "apikeys": {
+    "cn": [
+      {
+        "key": "tp-your-cn-key-here",
+        "status": "valid"
+      }
+    ],
+    "sgp": [
+      {
+        "key": "tp-your-sgp-key-here",
+        "status": "valid"
+      }
+    ]
+  },
+  "local_key": "your-local-password",
+  "endpoints": {
+    "cn": "https://token-plan-cn.xiaomimimo.com",
+    "sgp": "https://token-plan-sgp.xiaomimimo.com"
+  },
+  "port": 18888
+}
