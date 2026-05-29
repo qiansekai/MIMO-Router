@@ -1,6 +1,7 @@
 # CLAUDE.md
 
 > 变更记录 (Changelog)
+> - 2026-05-30 — 新增多模态路由、404 智能重试、模型回退机制
 > - 2026-05-27 02:15:40 — 全量扫描重构，新增 Mermaid 模块结构图、覆盖率报告、文档体系完善
 
 ## 项目概述
@@ -65,12 +66,15 @@ python mimo-keys.py archive          # 归档失效 key
 6. **后台刷新** — 每 30 秒探测所有 key 状态，恢复已修复的 key，仅在确定性失败时标记失效
 7. **端点冷却** — 404 响应触发 10 秒冷却期，避免向故障端点堆积请求
 8. **智能路由** — 检测到图片内容自动切换到 `mimo-v2.5` 模型，`-nothinking` 后缀自动转换为 `thinking: disabled`
+9. **404 智能重试** — 404 时跳过同端点 key，自动尝试其他端点，支持递增等待重试（最多 3 次）
+10. **模型回退** — 配置 `model_fallback` 链，当前模型失败时自动降级到下一个模型
 
 ## config.json 结构
 
 - `apikeys.cn[]` / `apikeys.sgp[]` — key 列表，每个包含 `key`、`status`，失效时附带 `error_code` 和 `error_message`
 - `local_key` — 本地代理认证密钥
 - `endpoints.cn` / `endpoints.sgp` — 上游 API 地址
+- `model_fallback[]` — 模型回退链，默认 `["mimo-v2.5-pro", "mimo-v2.5"]`
 - `port` — 代理监听端口（默认 18888）
 - `archive[]` — 归档的失效 key（由 `archive` 命令生成）
 

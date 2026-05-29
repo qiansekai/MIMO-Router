@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
-from mimo_core import CONFIG_PATH, load_config, probe_key, code_to_status, update_key_status
+from mimo_core import CONFIG_PATH, load_config, probe_key, code_to_status, update_key_status, get_model_fallback
 
 warnings.filterwarnings('ignore', message='Unclosed client session')
 warnings.filterwarnings('ignore', message='Unclosed connector')
@@ -71,6 +71,8 @@ class MimoRoute:
         self._config_check_interval = 2.0
         self._endpoint_down: dict[str, float] = {}  # endpoint_url -> last 404 time
         self._endpoint_cooldown = 10.0  # 404 后冷却秒数
+        self._endpoint_404_count: dict[str, int] = {}  # endpoint_url -> 404 次数
+        self._max_retries = 3  # 最大重试次数
 
     async def _get_session(self) -> ClientSession:
         if self._session is None or self._session.closed:
@@ -156,6 +158,28 @@ class MimoRoute:
             logger.info(f"key {key[:16]}... 已恢复")
             self.config = config
             self._invalidate_config_cache()
+
+    def _has_image_content(self, data: dict) -> bool:
+        """检测请求是否包含图片/多模态内容"""
+        messages = data.get('messages', [])
+        for msg in messages:
+            content = msg.get('content')
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        item_type = item.get('type', '')
+                        if item_type in ('image_url', 'image', 'file'):
+                            return True
+                        # 检测 base64 图片数据
+                        if item_type == 'text':
+                            text = item.get('text', '')
+                            if 'data:image/' in text and ';base64,' in text:
+                                return True
+            elif isinstance(content, str):
+                # 检测 base64 图片数据
+                if 'data:image/' in content and ';base64,' in content:
+                    return True
+        return False
 
     async def _forward(self, session: ClientSession, request: web.Request, body: bytes, key: str, endpoint_url: str):
         """转发请求，返回 StreamResponse=成功，None=需要重试"""
@@ -286,21 +310,38 @@ class MimoRoute:
         body = await request.read()
         await self._check_config_update()
 
+        # 解析请求体，处理模型转换
+        data = None
+        original_model = ''
         if request.content_type == 'application/json' and body:
             try:
                 data = json.loads(body)
-                model = data.get('model', '')
+                original_model = data.get('model', '')
                 modified = False
 
-                if model.endswith('-nothinking'):
-                    data['model'] = model.replace('-nothinking', '')
+                if original_model.endswith('-nothinking'):
+                    data['model'] = original_model.replace('-nothinking', '')
                     data['thinking'] = {'type': 'disabled'}
                     modified = True
+
+                # 多模态检测：图片内容路由到 mimo-v2.5
+                if self._has_image_content(data):
+                    data['model'] = 'mimo-v2.5'
+                    modified = True
+                    logger.info(f"检测到图片内容，路由到 mimo-v2.5 (原模型: {original_model})")
 
                 if modified:
                     body = json.dumps(data, ensure_ascii=False).encode('utf-8')
             except (json.JSONDecodeError, AttributeError):
                 pass
+
+        # 获取模型回退链
+        fallback_chain = get_model_fallback(self.config)
+        current_model_idx = 0
+        if data and data.get('model'):
+            current_model = data['model']
+            if current_model in fallback_chain:
+                current_model_idx = fallback_chain.index(current_model)
 
         valid_keys, recovery_keys = self._get_all_keys()
         if not valid_keys and not recovery_keys:
@@ -309,44 +350,90 @@ class MimoRoute:
                                 headers={'Access-Control-Allow-Origin': '*'})
 
         n = len(valid_keys)
-        now = time.monotonic()
-        i = 0
-        while i < n:
-            idx = (self._key_index + i) % n
-            info = valid_keys[idx]
-            endpoint_url = self.config['endpoints'].get(info['endpoint'])
-            if not endpoint_url:
-                i += 1
-                continue
-            down_since = self._endpoint_down.get(endpoint_url)
-            if down_since and now - down_since < self._endpoint_cooldown:
-                i += 1
-                continue
-            resp = await self._forward(session, request, body, info['key'], endpoint_url)
-            if resp is not None:
-                self._key_index = (idx + 1) % n
-                return resp
-            if self._last_error_permanent:
-                i += 1
-                continue
-            # 非永久错误(404等)，跳过同端点的剩余 key，尝试其他端点
-            failed_endpoint = info['endpoint']
-            skipped = True
-            for j in range(i + 1, n):
-                next_idx = (self._key_index + j) % n
-                if valid_keys[next_idx]['endpoint'] != failed_endpoint:
-                    i = j
-                    skipped = False
-                    break
-            if skipped:
-                # 没有其他端点可试，等冷却后重试
-                for ep_url, down_time in list(self._endpoint_down.items()):
-                    remaining = self._endpoint_cooldown - (now - down_time)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        now = time.monotonic()
-                break
+        model_fallback_used = False
 
+        # 模型回退循环
+        for model_idx in range(current_model_idx, len(fallback_chain)):
+            current_model = fallback_chain[model_idx]
+
+            # 如果不是第一个模型，更新 body
+            if model_idx > current_model_idx and data:
+                data['model'] = current_model
+                body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+                model_fallback_used = True
+                logger.info(f"模型回退: {fallback_chain[model_idx - 1]} -> {current_model}")
+
+            retry_count = 0
+            while retry_count < self._max_retries:
+                now = time.monotonic()
+                i = 0
+                tried_any = False
+
+                while i < n:
+                    idx = (self._key_index + i) % n
+                    info = valid_keys[idx]
+                    endpoint_url = self.config['endpoints'].get(info['endpoint'])
+                    if not endpoint_url:
+                        i += 1
+                        continue
+
+                    # 检查端点冷却状态
+                    down_since = self._endpoint_down.get(endpoint_url)
+                    if down_since and now - down_since < self._endpoint_cooldown:
+                        i += 1
+                        continue
+
+                    tried_any = True
+                    resp = await self._forward(session, request, body, info['key'], endpoint_url)
+                    if resp is not None:
+                        self._key_index = (idx + 1) % n
+                        if model_fallback_used:
+                            logger.info(f"模型回退成功，使用: {current_model}")
+                        return resp
+
+                    if self._last_error_permanent:
+                        i += 1
+                        continue
+
+                    # 404 等非永久错误：记录并尝试下一个端点
+                    failed_endpoint = info['endpoint']
+                    failed_endpoint_url = endpoint_url
+                    self._endpoint_404_count[failed_endpoint_url] = self._endpoint_404_count.get(failed_endpoint_url, 0) + 1
+                    logger.debug(f"端点 {failed_endpoint_url} 返回 404，累计: {self._endpoint_404_count[failed_endpoint_url]} 次")
+
+                    # 跳过同端点的剩余 key
+                    skipped = True
+                    for j in range(i + 1, n):
+                        next_idx = (self._key_index + j) % n
+                        if valid_keys[next_idx]['endpoint'] != failed_endpoint:
+                            i = j
+                            skipped = False
+                            break
+                    if skipped:
+                        break
+
+                # 如果没有尝试任何 key（都被冷却），等待后重试
+                if not tried_any:
+                    min_wait = min(
+                        (self._endpoint_cooldown - (now - t)
+                         for t in self._endpoint_down.values() if now - t < self._endpoint_cooldown),
+                        default=self._endpoint_cooldown
+                    )
+                    logger.info(f"所有端点冷却中，等待 {min_wait:.1f}s 后重试 ({retry_count + 1}/{self._max_retries})")
+                    await asyncio.sleep(min_wait)
+                    retry_count += 1
+                    continue
+
+                # 尝试了 key 但都失败，等待后重试
+                retry_count += 1
+                if retry_count < self._max_retries:
+                    wait_time = min(2.0 * retry_count, 10.0)  # 递增等待，最多 10 秒
+                    logger.info(f"本轮所有 key 失败，等待 {wait_time}s 后重试 ({retry_count}/{self._max_retries})")
+                    await asyncio.sleep(wait_time)
+                    # 重置端点冷却，允许重试
+                    self._endpoint_down.clear()
+
+        # 所有模型和重试都失败，尝试 recovery keys
         for info in recovery_keys:
             endpoint_url = self.config['endpoints'].get(info['endpoint'])
             if not endpoint_url:

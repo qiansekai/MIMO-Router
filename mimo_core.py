@@ -8,10 +8,18 @@ CONFIG_PATH = Path(__file__).parent / 'config.json'
 PROBE_MODEL = 'mimo-v2.5-pro'
 PROBE_TIMEOUT = 5
 
+# 默认模型回退链：失败时按顺序尝试下一个模型
+DEFAULT_MODEL_FALLBACK = ['mimo-v2.5-pro', 'mimo-v2.5']
+
 
 def load_config() -> dict:
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+def get_model_fallback(config: dict) -> list[str]:
+    """获取模型回退链，从配置或默认值"""
+    return config.get('model_fallback', DEFAULT_MODEL_FALLBACK)
 
 
 def save_config(config: dict):
