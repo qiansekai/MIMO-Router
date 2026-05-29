@@ -86,14 +86,35 @@ curl http://localhost:18888/v1/chat/completions \
 
 ### Claude Code 集成
 
-在 Claude Code 中配置使用 MIMO-Router：
+在 Claude Code 的 `settings.json` 中配置环境变量，将请求转发到 MIMO-Router：
 
-```json
+```jsonc
 {
-  "api_base_url": "http://localhost:18888",
-  "api_key": "your-local-password"
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "your-local-password",
+    "ANTHROPIC_BASE_URL": "http://localhost:18888",
+    "ANTHROPIC_MODEL": "mimo-v2.5-pro[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "mimo-v2.5-pro",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "mimo-v2.5-pro",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "mimo-v2.5[1m]",
+    "ANTHROPIC_SMALL_FAST_MODEL": "mimo-v2.5-nothinking",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "mimo-v2-pro",
+    "API_TIMEOUT_MS": "600000"
+  }
 }
 ```
+
+| 环境变量 | 说明 |
+|----------|------|
+| `ANTHROPIC_AUTH_TOKEN` | MIMO-Router 的 `local_key` |
+| `ANTHROPIC_BASE_URL` | 代理地址，指向 MIMO-Router |
+| `ANTHROPIC_MODEL` | 主模型，`[1m]` 表示 1M 上下文 |
+| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Opus 模型映射 |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Sonnet 模型映射 |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Haiku 模型映射 |
+| `ANTHROPIC_SMALL_FAST_MODEL` | 轻量快速模型（禁用思考） |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | 子代理使用的模型 |
+| `API_TIMEOUT_MS` | 请求超时（毫秒），默认 600000（10 分钟） |
 
 ## Key 管理
 

@@ -57,7 +57,7 @@ def code_to_status(code: int, error_body: str) -> str | None:
 
 
 def update_key_status(key: str, status: str, error_code: int = 0, error_message: str = ''):
-    """更新 config.json 中 key 的状态，quota_exhausted 自动归档"""
+    """更新 config.json 中 key 的状态，quota_exhausted 自动归档。返回 (changed, config)"""
     try:
         config = load_config()
         changed = False
@@ -83,6 +83,6 @@ def update_key_status(key: str, status: str, error_code: int = 0, error_message:
                             archived.append(k)
         if changed:
             save_config(config)
-        return changed
+        return changed, config
     except Exception:
-        return False
+        return False, None

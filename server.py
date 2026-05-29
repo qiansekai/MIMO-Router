@@ -33,20 +33,25 @@ def cleanup_old_logs():
         return
     cutoff = datetime.now() - timedelta(days=LOG_MAX_DAYS)
     cutoff_str = cutoff.strftime('%Y-%m-%d')
-    kept, dropped = [], 0
-    with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            # 日志格式: [2026-05-26 00:00:00,000]
-            if line.startswith('[') and len(line) > 11:
-                date_str = line[1:11]
-                if date_str < cutoff_str:
-                    dropped += 1
-                    continue
-            kept.append(line)
-    if dropped:
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.writelines(kept)
-        logger.info(f"已清理 {dropped} 条过期日志 (早于 {cutoff_str})")
+    tmp_file = log_file.with_suffix('.tmp')
+    dropped = 0
+    try:
+        with open(log_file, 'r', encoding='utf-8', errors='ignore') as src, \
+             open(tmp_file, 'w', encoding='utf-8') as dst:
+            for line in src:
+                if line.startswith('[') and len(line) > 11:
+                    date_str = line[1:11]
+                    if date_str < cutoff_str:
+                        dropped += 1
+                        continue
+                dst.write(line)
+        if dropped:
+            tmp_file.replace(log_file)
+            logger.info(f"已清理 {dropped} 条过期日志 (早于 {cutoff_str})")
+        else:
+            tmp_file.unlink(missing_ok=True)
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
 
 
 class MimoRoute:
@@ -94,13 +99,14 @@ class MimoRoute:
         self._cached_keys = None
         self._config_check_time = 0
 
-    def _check_config_update(self):
+    async def _check_config_update(self):
         now = time.monotonic()
         if now - self._config_check_time < self._config_check_interval:
             return
         self._config_check_time = now
         try:
-            mtime = CONFIG_PATH.stat().st_mtime
+            loop = asyncio.get_running_loop()
+            mtime = await loop.run_in_executor(None, lambda: CONFIG_PATH.stat().st_mtime)
             if mtime > self.last_modified:
                 self.config = self._load_config()
                 self.last_modified = mtime
@@ -133,9 +139,10 @@ class MimoRoute:
         loop.run_in_executor(None, self._invalidate_key_sync, key, endpoint, error_code, error_message)
 
     def _invalidate_key_sync(self, key: str, endpoint: str, error_code: int, error_message: str):
-        if update_key_status(key, 'invalid', error_code, error_message):
+        changed, config = update_key_status(key, 'invalid', error_code, error_message)
+        if changed and config:
             logger.warning(f"key {key[:16]}... 已失效 (endpoint: {endpoint}, code: {error_code})")
-            self.config = load_config()
+            self.config = config
             self._invalidate_config_cache()
 
     def _recover_key(self, key: str):
@@ -144,9 +151,10 @@ class MimoRoute:
         loop.run_in_executor(None, self._recover_key_sync, key)
 
     def _recover_key_sync(self, key: str):
-        if update_key_status(key, 'valid'):
+        changed, config = update_key_status(key, 'valid')
+        if changed and config:
             logger.info(f"key {key[:16]}... 已恢复")
-            self.config = load_config()
+            self.config = config
             self._invalidate_config_cache()
 
     async def _forward(self, session: ClientSession, request: web.Request, body: bytes, key: str, endpoint_url: str):
@@ -200,8 +208,15 @@ class MimoRoute:
 
                 await stream.write_eof()
                 return stream
+        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
+            logger.debug(f"客户端断开连接: {key[:8]}... endpoint={endpoint_url}")
+            self._last_error_permanent = False
+            return None
         except Exception as e:
-            logger.error(f"转发失败: {e}")
+            if 'Cannot write to closing transport' in str(e):
+                logger.debug(f"客户端断开连接: {key[:8]}... endpoint={endpoint_url}")
+            else:
+                logger.error(f"转发失败: {e}")
             self._last_error_permanent = False
             return None
 
@@ -225,14 +240,20 @@ class MimoRoute:
             return ep, key, code, error_body
 
         results = await asyncio.gather(*(probe(ep, key) for ep, key in keys_snapshot))
+        any_changed = False
+        last_config = None
         for ep, key, code, error_body in results:
             status = code_to_status(code, error_body)
             if status is not None:
-                if update_key_status(key, status, code if code > 0 else 0, error_body):
+                changed, config = update_key_status(key, status, code if code > 0 else 0, error_body)
+                if changed:
+                    any_changed = True
+                    last_config = config
                     logger.info(f"key {key[:16]}... 状态更新为 {status} (endpoint: {ep})")
 
-        self.config = load_config()
-        self._invalidate_config_cache()
+        if any_changed and last_config:
+            self.config = last_config
+            self._invalidate_config_cache()
         cn_valid = sum(1 for k in self.config['apikeys'].get('cn', []) if isinstance(k, dict) and k.get('status') == 'valid')
         sgp_valid = sum(1 for k in self.config['apikeys'].get('sgp', []) if isinstance(k, dict) and k.get('status') == 'valid')
         if cn_valid != self._last_cn_valid or sgp_valid != self._last_sgp_valid:
@@ -263,13 +284,18 @@ class MimoRoute:
             )
         session = await self._get_session()
         body = await request.read()
-        self._check_config_update()
+        await self._check_config_update()
 
         if request.content_type == 'application/json' and body:
             try:
                 data = json.loads(body)
                 model = data.get('model', '')
                 modified = False
+
+                if model.endswith('-nothinking'):
+                    data['model'] = model.replace('-nothinking', '')
+                    data['thinking'] = {'type': 'disabled'}
+                    modified = True
 
                 if modified:
                     body = json.dumps(data, ensure_ascii=False).encode('utf-8')
@@ -284,42 +310,42 @@ class MimoRoute:
 
         n = len(valid_keys)
         now = time.monotonic()
-        had_endpoint_error = False
-        for i in range(n):
+        i = 0
+        while i < n:
             idx = (self._key_index + i) % n
             info = valid_keys[idx]
             endpoint_url = self.config['endpoints'].get(info['endpoint'])
             if not endpoint_url:
+                i += 1
                 continue
-            # 端点冷却中，跳过
             down_since = self._endpoint_down.get(endpoint_url)
             if down_since and now - down_since < self._endpoint_cooldown:
+                i += 1
                 continue
             resp = await self._forward(session, request, body, info['key'], endpoint_url)
             if resp is not None:
                 self._key_index = (idx + 1) % n
                 return resp
-            if not self._last_error_permanent:
-                had_endpoint_error = True
-                break
-
-        # 端点错误等冷却结束后重试
-        if had_endpoint_error:
-            for ep_url, down_time in list(self._endpoint_down.items()):
-                remaining = self._endpoint_cooldown - (now - down_time)
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
+            if self._last_error_permanent:
+                i += 1
+                continue
+            # 非永久错误(404等)，跳过同端点的剩余 key，尝试其他端点
+            failed_endpoint = info['endpoint']
+            skipped = True
+            for j in range(i + 1, n):
+                next_idx = (self._key_index + j) % n
+                if valid_keys[next_idx]['endpoint'] != failed_endpoint:
+                    i = j
+                    skipped = False
                     break
-            for i in range(n):
-                idx = (self._key_index + i) % n
-                info = valid_keys[idx]
-                endpoint_url = self.config['endpoints'].get(info['endpoint'])
-                if not endpoint_url:
-                    continue
-                resp = await self._forward(session, request, body, info['key'], endpoint_url)
-                if resp is not None:
-                    self._key_index = (idx + 1) % n
-                    return resp
+            if skipped:
+                # 没有其他端点可试，等冷却后重试
+                for ep_url, down_time in list(self._endpoint_down.items()):
+                    remaining = self._endpoint_cooldown - (now - down_time)
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                        now = time.monotonic()
+                break
 
         for info in recovery_keys:
             endpoint_url = self.config['endpoints'].get(info['endpoint'])
