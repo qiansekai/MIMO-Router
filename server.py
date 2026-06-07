@@ -345,9 +345,15 @@ class MimoRoute:
 
         valid_keys, recovery_keys = self._get_all_keys()
         if not valid_keys and not recovery_keys:
-            logger.error("所有key不可用")
-            return web.Response(status=503, text=json.dumps({'error': 'All keys exhausted'}), content_type='application/json',
-                                headers={'Access-Control-Allow-Origin': '*'})
+            # 无可用 key 时强制重新加载配置（可能刚导入了新 key）
+            self.config = self._load_config()
+            self._key_index = 0
+            self._cached_keys = None
+            valid_keys, recovery_keys = self._get_all_keys()
+            if not valid_keys and not recovery_keys:
+                logger.error("所有key不可用")
+                return web.Response(status=503, text=json.dumps({'error': 'All keys exhausted'}), content_type='application/json',
+                                    headers={'Access-Control-Allow-Origin': '*'})
 
         n = len(valid_keys)
         model_fallback_used = False
