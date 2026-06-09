@@ -19,5 +19,17 @@
     "sgp": "https://token-plan-sgp.xiaomimimo.com"
   },
   "model_fallback": ["mimo-v2.5-pro", "mimo-v2.5"],
-  "port": 18888
+  "port": 18888,
+  "archive": [],
+  "archived": {
+    "cn": [],
+    "sgp": []
+  },
+  "sync": {
+    "gist_id": "",
+    "password": "",
+    "remote_url": "",
+    "auto_push": false,
+    "pull_interval": 300
+  }
 }

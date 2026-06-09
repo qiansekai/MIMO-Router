@@ -1,6 +1,7 @@
 # CLAUDE.md
 
 > 变更记录 (Changelog)
+> - 2026-06-09 — 新增远程加密配置同步（Fernet 加密 + GitHub Gist 托管）
 > - 2026-05-30 — 新增多模态路由、404 智能重试、模型回退机制
 > - 2026-05-27 02:15:40 — 全量扫描重构，新增 Mermaid 模块结构图、覆盖率报告、文档体系完善
 
@@ -32,12 +33,12 @@ graph TD
 | 文件 | 职责 | 依赖 |
 |------|------|------|
 | `server.py` | aiohttp 代理服务器，核心类 `MimoRoute`，处理所有 HTTP 请求转发 | `mimo_core.py`, `aiohttp` |
-| `mimo_core.py` | 配置读写、Key 探测、状态码映射、状态更新（含归档逻辑） | `aiohttp` |
-| `mimo-keys.py` | CLI 工具，提供 import / check / archive 命令管理 Key | `mimo_core.py`, `aiohttp` |
+| `mimo_core.py` | 配置读写、Key 探测、状态码映射、状态更新、加密/解密、远程同步 | `aiohttp`, `cryptography` |
+| `mimo-keys.py` | CLI 工具，提供 import / check / archive / sync 命令管理 Key | `mimo_core.py`, `aiohttp` |
 | `config.json` | 运行时配置（gitignored，含 API key） | — |
 | `config.example.json` | 配置模板 | — |
 | `start.bat` | Windows 启动脚本，自动释放端口并启动 | — |
-| `requirements.txt` | 依赖声明：`aiohttp>=3.9.0` | — |
+| `requirements.txt` | 依赖声明：`aiohttp>=3.9.0`, `cryptography>=41.0.0` | — |
 | `docs/` | 关联文档与脚本（CTF 代理、反代方案等） | — |
 
 ## 常用命令
@@ -53,6 +54,12 @@ python mimo-keys.py import key1 key2 key3                 # 批量导入（并�
 python mimo-keys.py import <base64字符串> --base64         # 强制 base64 解码（dHA 开头自动识别）
 python mimo-keys.py archive          # 归档失效 key
 python mimo-keys.py refresh          # 重新探测归档 key，恢复可用的到活跃列表
+
+# 远程加密同步
+python mimo-keys.py sync create --password <密码>         # 创建 Gist 并自动配置
+python mimo-keys.py sync setup --gist-id <id> --password <密码>  # 手动配置同步参数
+python mimo-keys.py sync push        # 手动推送加密配置到 Gist
+python mimo-keys.py sync pull        # 手动拉取远程加密配置
 ```
 
 ## 架构
@@ -69,6 +76,7 @@ python mimo-keys.py refresh          # 重新探测归档 key，恢复可用的�
 8. **智能路由** — 检测到图片内容自动切换到 `mimo-v2.5` 模型，`-nothinking` 后缀自动转换为 `thinking: disabled`
 9. **404 智能重试** — 404 时跳过同端点 key，自动尝试其他端点，支持递增等待重试（最多 3 次）
 10. **模型回退** — 配置 `model_fallback` 链，当前模型失败时自动降级到下一个模型
+11. **远程同步** — 启动时从远程 URL 拉取加密配置，定期刷新；CLI 操作（import/archive/refresh）后自动推送
 
 ## config.json 结构
 
@@ -78,6 +86,11 @@ python mimo-keys.py refresh          # 重新探测归档 key，恢复可用的�
 - `model_fallback[]` — 模型回退链，默认 `["mimo-v2.5-pro", "mimo-v2.5"]`
 - `port` — 代理监听端口（默认 18888）
 - `archive[]` — 归档的失效 key（由 `archive` 命令生成）
+- `sync.gist_id` — GitHub Gist ID
+- `sync.password` — 加密/解密密码（Fernet + PBKDF2）
+- `sync.remote_url` — 远程加密配置的 Raw URL
+- `sync.auto_push` — CLI 操作后自动推送（管理员用）
+- `sync.pull_interval` — 服务器拉取间隔秒数（默认 300）
 
 ## Key 状态
 
@@ -87,7 +100,7 @@ python mimo-keys.py refresh          # 重新探测归档 key，恢复可用的�
 
 ## 依赖
 
-仅 `aiohttp>=3.9.0`，Python 3.8+。
+`aiohttp>=3.9.0`、`cryptography>=41.0.0`，Python 3.10+。可选依赖：GitHub CLI（`gh`，用于 Gist 创建/更新）。
 
 ## 测试策略
 
@@ -109,3 +122,5 @@ python mimo-keys.py refresh          # 重新探测归档 key，恢复可用的�
 - Key 状态流转：`valid` -> `invalid`/`quota_exhausted` -> 归档；恢复只从 `invalid`/`quota_exhausted` 回到 `valid`
 - `disabled` 状态是终态，不受后台刷新影响
 - 修改 `config.json` 结构时需同步更新 `config.example.json` 和 `mimo_core.py` 中的读写逻辑
+- 远程同步使用 Fernet 加密（AES-128-CBC + HMAC），密钥通过 PBKDF2-SHA256 派生（480000 轮迭代）
+- 合并策略：远程 apikeys/archived/endpoints 覆盖本地，local_key/port/sync 配置保留本地值

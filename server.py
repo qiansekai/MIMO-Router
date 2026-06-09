@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
-from mimo_core import CONFIG_PATH, load_config, save_config, probe_key, code_to_status, update_key_status, get_model_fallback
+from mimo_core import CONFIG_PATH, load_config, save_config, probe_key, code_to_status, update_key_status, get_model_fallback, sync_pull, merge_apikeys
 
 warnings.filterwarnings('ignore', message='Unclosed client session')
 warnings.filterwarnings('ignore', message='Unclosed connector')
@@ -385,10 +385,62 @@ class MimoRoute:
             self._invalidate_config_cache()
             logger.info(f"归档刷新: 恢复 {moved} 个 key 到活跃列表")
 
+    async def _pull_remote_config(self):
+        """从远程拉取加密配置并合并（按 key 合并，保留本地更差状态）"""
+        sync = self.config.get('sync', {})
+        if not sync.get('remote_url'):
+            return
+        if not sync.get('password'):
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+            remote = await loop.run_in_executor(None, sync_pull)
+            if not remote:
+                return
+
+            changed = False
+
+            # apikeys：按 key 合并，保留本地更差状态
+            if 'apikeys' in remote:
+                merged = merge_apikeys(
+                    self.config.get('apikeys', {}),
+                    remote['apikeys'],
+                )
+                if merged != self.config.get('apikeys', {}):
+                    self.config['apikeys'] = merged
+                    changed = True
+
+            # archived/archive：远程全量覆盖（管理员归档操作）
+            for field in ('archived', 'archive'):
+                if field in remote and remote[field] != self.config.get(field):
+                    self.config[field] = remote[field]
+                    changed = True
+
+            # endpoints/model_fallback：远程全量覆盖
+            for field in ('model_fallback', 'endpoints'):
+                if field in remote and remote[field] != self.config.get(field):
+                    self.config[field] = remote[field]
+                    changed = True
+
+            if changed:
+                save_config(self.config)
+                self.last_modified = CONFIG_PATH.stat().st_mtime
+                self._invalidate_config_cache()
+                apikeys = self.config.get('apikeys', {})
+                cn = len(apikeys.get('cn', []))
+                sgp = len(apikeys.get('sgp', []))
+                logger.info(f"远程配置已同步，cn: {cn} 个 key，sgp: {sgp} 个 key")
+        except Exception as e:
+            logger.warning(f"远程配置拉取异常: {e}")
+
     async def _background_refresh(self, app: web.Application):
         """启动时立即刷新，之后每 30 秒轮询活跃 key，每 10 分钟轮询归档 key"""
+        # 启动时拉取远程配置
+        await self._pull_remote_config()
         await self._refresh_keys()
         last_archived_refresh = 0.0
+        last_pull = 0.0
         while True:
             await asyncio.sleep(30)
             try:
@@ -397,6 +449,14 @@ class MimoRoute:
                 logger.error(f"后台刷新异常: {e}")
 
             now = time.monotonic()
+            pull_interval = self.config.get('sync', {}).get('pull_interval', 300)
+            if pull_interval > 0 and now - last_pull >= pull_interval:
+                last_pull = now
+                try:
+                    await self._pull_remote_config()
+                except Exception as e:
+                    logger.error(f"远程配置拉取异常: {e}")
+
             if now - last_archived_refresh >= self._archived_refresh_interval:
                 last_archived_refresh = now
                 try:

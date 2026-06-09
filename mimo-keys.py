@@ -1,11 +1,15 @@
 import asyncio
+import json
+import subprocess
 import sys
 import re
 import argparse
 import base64
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from aiohttp import ClientSession, ClientTimeout
-from mimo_core import CONFIG_PATH, load_config, save_config, probe_key, code_to_status, update_key_status
+from mimo_core import CONFIG_PATH, load_config, save_config, probe_key, code_to_status, update_key_status, sync_push, sync_pull, encrypt_config, merge_apikeys
 
 
 def is_valid_key(s: str) -> bool:
@@ -148,6 +152,7 @@ async def cmd_import(args):
 
     if ok_count > 0:
         save_config(config)
+        _auto_push(config)
         print(f"\n导入成功 {ok_count} 个")
 
 
@@ -330,6 +335,7 @@ async def cmd_refresh(args):
         config['archived'][ep] = new_ep
 
     save_config(config)
+    _auto_push(config)
 
     # 汇总
     total_active = sum(len(v) for v in config.get('apikeys', {}).values())
@@ -359,6 +365,7 @@ def cmd_archive(args):
 
     if archived > 0:
         save_config(config)
+        _auto_push(config)
         print(f"归档 {archived} 个失效 key")
     else:
         print("无需归档")
@@ -367,6 +374,130 @@ def cmd_archive(args):
     valid = sum(1 for v in config.get('apikeys', {}).values() for k in v if isinstance(k, dict) and k.get('status') == 'valid')
     archive_total = len(config.get('archive', []))
     print(f"剩余: {total} 个 key（{valid} 个有效），归档: {archive_total} 个")
+
+
+def _auto_push(config: dict):
+    """如果配置了 auto_push，自动推送到远程"""
+    if config.get('sync', {}).get('auto_push'):
+        print("自动推送到远程...")
+        if sync_push(config):
+            print("推送成功")
+        else:
+            print("推送失败（详见日志）")
+
+
+def cmd_sync_setup(args):
+    """配置远程同步参数"""
+    config = load_config()
+    sync = config.setdefault('sync', {})
+
+    if args.gist_id:
+        sync['gist_id'] = args.gist_id
+    if args.password:
+        sync['password'] = args.password
+    if args.remote_url:
+        sync['remote_url'] = args.remote_url
+    if args.pull_interval is not None:
+        sync['pull_interval'] = args.pull_interval
+    if args.auto_push is not None:
+        sync['auto_push'] = args.auto_push == 'true'
+
+    save_config(config)
+    print("同步配置已更新:")
+    for k, v in sync.items():
+        display = '***' if k == 'password' and v else v
+        print(f"  {k}: {display}")
+
+
+def cmd_sync_push(args):
+    """手动推送配置到远程"""
+    config = load_config()
+    if sync_push(config):
+        print("推送成功")
+    else:
+        print("推送失败")
+        sys.exit(1)
+
+
+def cmd_sync_pull(args):
+    """手动拉取远程配置"""
+    remote = sync_pull()
+    if not remote:
+        print("拉取失败或远程配置为空")
+        sys.exit(1)
+
+    config = load_config()
+
+    # apikeys：按 key 合并，保留本地更差状态
+    if 'apikeys' in remote:
+        config['apikeys'] = merge_apikeys(config.get('apikeys', {}), remote['apikeys'])
+
+    # archived/archive/endpoints/model_fallback：远程全量覆盖
+    for field in ('archived', 'archive', 'model_fallback', 'endpoints'):
+        if field in remote:
+            config[field] = remote[field]
+
+    save_config(config)
+    apikeys = config.get('apikeys', {})
+    cn = len(apikeys.get('cn', []))
+    sgp = len(apikeys.get('sgp', []))
+    print(f"拉取成功，cn: {cn} 个 key，sgp: {sgp} 个 key")
+
+
+def cmd_sync_create(args):
+    """创建新的 GitHub Gist 用于配置同步"""
+    config = load_config()
+    password = args.password or config.get('sync', {}).get('password', '')
+    if not password:
+        print("错误: 需要指定 --password 或已在 sync.password 中配置")
+        sys.exit(1)
+
+    # 生成加密内容
+    encrypted = encrypt_config(json.dumps(config, ensure_ascii=False), password)
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.enc', delete=False, encoding='utf-8') as f:
+            f.write(encrypted)
+            tmp_path = f.name
+
+        result = subprocess.run(
+            ['gh', 'gist', 'create', '--public', tmp_path, '-d', 'mimo-route encrypted config'],
+            capture_output=True, text=True, timeout=30,
+        )
+        Path(tmp_path).unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            print(f"创建 Gist 失败: {result.stderr.strip()}")
+            sys.exit(1)
+
+        # 输出中提取 URL
+        output = result.stdout.strip()
+        print(f"Gist 创建成功: {output}")
+
+        # 提取 gist ID
+        import re
+        match = re.search(r'gist\.github\.com/[^/]+/([a-f0-9]+)', output)
+        if match:
+            gist_id = match.group(1)
+            # 自动写入 sync 配置
+            sync = config.setdefault('sync', {})
+            sync['gist_id'] = gist_id
+            sync['password'] = password
+            save_config(config)
+            print(f"\n已自动写入 sync 配置:")
+            print(f"  gist_id: {gist_id}")
+            print(f"  remote_url: https://gist.githubusercontent.com/raw/{gist_id}")
+            print(f"\n朋友的 config.json 需要添加:")
+            print(f'  "sync": {{')
+            print(f'    "remote_url": "https://gist.githubusercontent.com/<你的用户名>/{gist_id}/raw/<文件名>",')
+            print(f'    "password": "{password}"')
+            print(f'  }}')
+
+    except FileNotFoundError:
+        print("错误: gh CLI 未安装，请先安装 https://cli.github.com/")
+        sys.exit(1)
+    except Exception as e:
+        print(f"创建 Gist 异常: {e}")
+        sys.exit(1)
 
 
 def main():
@@ -385,6 +516,23 @@ def main():
 
     p_refresh = sub.add_parser('refresh', help='重新探测归档key，恢复可用的')
 
+    # sync 子命令
+    p_sync = sub.add_parser('sync', help='远程加密同步')
+    sync_sub = p_sync.add_subparsers(dest='sync_command')
+
+    p_sync_setup = sync_sub.add_parser('setup', help='配置同步参数')
+    p_sync_setup.add_argument('--gist-id', help='GitHub Gist ID')
+    p_sync_setup.add_argument('--password', help='加密密码')
+    p_sync_setup.add_argument('--remote-url', help='远程加密配置 URL')
+    p_sync_setup.add_argument('--pull-interval', type=int, help='拉取间隔（秒）')
+    p_sync_setup.add_argument('--auto-push', choices=['true', 'false'], help='变更后自动推送 (true/false)')
+
+    p_sync_push = sync_sub.add_parser('push', help='手动推送到远程')
+    p_sync_pull = sync_sub.add_parser('pull', help='手动拉取远程配置')
+
+    p_sync_create = sync_sub.add_parser('create', help='创建新 Gist')
+    p_sync_create.add_argument('--password', help='加密密码')
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -401,6 +549,18 @@ def main():
         cmd_archive(args)
     elif args.command == 'refresh':
         asyncio.run(cmd_refresh(args))
+    elif args.command == 'sync':
+        if not args.sync_command:
+            p_sync.print_help()
+            sys.exit(1)
+        if args.sync_command == 'setup':
+            cmd_sync_setup(args)
+        elif args.sync_command == 'push':
+            cmd_sync_push(args)
+        elif args.sync_command == 'pull':
+            cmd_sync_pull(args)
+        elif args.sync_command == 'create':
+            cmd_sync_create(args)
 
 
 if __name__ == '__main__':
