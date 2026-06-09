@@ -54,13 +54,21 @@ async def probe_key(session: ClientSession, key: str, endpoint_url: str) -> tupl
 
 
 def code_to_status(code: int, error_body: str) -> str | None:
-    """状态码 → key 状态，None=无法判断"""
+    """状态码 → key 状态，None=无法判断
+
+    429 区分两种情况：
+    - "quota exhausted" → 额度耗尽，归档
+    - "Too many requests" → 限流，临时错误，不归档
+    """
     if code == 200:
         return 'valid'
     if code in (401, 403):
         return 'invalid'
-    if code == 429 and 'quota' in error_body.lower():
-        return 'quota_exhausted'
+    if code == 429:
+        body_lower = error_body.lower()
+        if 'quota' in body_lower:
+            return 'quota_exhausted'
+        return 'rate_limited'
     return None
 
 
@@ -84,7 +92,7 @@ def update_key_status(key: str, status: str, error_code: int = 0, error_message:
                             k['error_message'] = error_message
                         changed = True
 
-                        if status in ('quota_exhausted', 'invalid'):
+                        if status in ('invalid', 'quota_exhausted'):
                             key_list.remove(k)
                             archived = config.setdefault('archived', {}).setdefault(ep, [])
                             k['archived_at'] = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')

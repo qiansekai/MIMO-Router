@@ -39,17 +39,18 @@ async def detect_endpoint(session: ClientSession, key: str, endpoints: dict) -> 
     async def try_endpoint(name, url):
         code, error_body = await probe_key(session, key, url)
         if code == 401:
-            return None
+            return {'endpoint': name, 'status': 'invalid', 'error_code': 401, 'message': 'Unauthorized'}
         if code == 200:
             return {'endpoint': name, 'status': 'valid', 'error_code': 0, 'message': 'OK'}
         status = code_to_status(code, error_body) or 'error'
         return {'endpoint': name, 'status': status, 'error_code': code, 'message': error_body}
 
     results = await asyncio.gather(*(try_endpoint(n, u) for n, u in endpoints.items()))
-    for r in results:
-        if r is not None:
-            return r
-    return None
+    valid_results = [r for r in results if r['status'] != 'invalid']
+    if valid_results:
+        return valid_results[0]
+    # 所有端点都返回 401，返回第一个结果作为错误信息
+    return results[0] if results else None
 
 
 async def check_key(session: ClientSession, key_info: dict, endpoints: dict) -> dict:
@@ -87,11 +88,17 @@ async def _import_one(session: ClientSession, raw_key: str, config: dict, endpoi
 
     result = await detect_endpoint(session, key, endpoints)
     if not result:
-        return {'key': key, 'status': 'fail'}
+        return {'key': key, 'status': 'fail', 'error_code': 0, 'message': '无法连接端点'}
 
     ep = result['endpoint']
     if result['status'] == 'valid':
         return {'key': key, 'status': 'ok', 'endpoint': ep}
+    if result['status'] == 'rate_limited':
+        return {'key': key, 'status': 'rate_limited', 'endpoint': ep,
+                'error_code': result['error_code'], 'message': result['message']}
+    if result['status'] == 'invalid':
+        return {'key': key, 'status': 'fail', 'endpoint': ep,
+                'error_code': result['error_code'], 'message': result['message']}
     return {'key': key, 'status': 'error', 'endpoint': ep,
             'error_code': result['error_code'], 'message': result['message']}
 
@@ -116,9 +123,21 @@ async def cmd_import(args):
         if r['status'] == 'dup':
             print(f"  {key_short}  已存在 ({r['endpoint']})")
         elif r['status'] == 'fail':
-            print(f"  {key_short}  无法检测端点")
+            ep = r.get('endpoint', 'unknown')
+            code = r.get('error_code', '')
+            msg = r.get('message', '')
+            print(f"  {key_short}  {ep}  {code} {msg}")
         elif r['status'] == 'error':
             print(f"  {key_short}  {r['endpoint']}  {r.get('error_code','')} {r['message']}")
+        elif r['status'] == 'rate_limited':
+            ep = r['endpoint']
+            if ep not in config['apikeys']:
+                config['apikeys'][ep] = []
+            config['apikeys'][ep].append({'key': r['key'], 'status': 'rate_limited',
+                                          'error_code': r.get('error_code', 429),
+                                          'error_message': r.get('message', '')})
+            print(f"  {key_short}  -> {ep} (rate_limited，等待恢复)")
+            ok_count += 1
         elif r['status'] == 'ok':
             ep = r['endpoint']
             if ep not in config['apikeys']:
@@ -188,6 +207,138 @@ async def cmd_check(args):
     return [r for r in results if r['status'] == 'valid']
 
 
+async def cmd_refresh(args):
+    """重新探测归档中的 key，恢复可用的到活跃列表"""
+    config = load_config()
+    endpoints = config.get('endpoints', {})
+
+    # 已在活跃列表的 key（去重用）
+    active_keys = set()
+    for key_list in config.get('apikeys', {}).values():
+        for k in key_list:
+            if isinstance(k, dict):
+                active_keys.add(k['key'])
+
+    # 收集归档 key：archive (flat) + archived.cn/sgp (nested)
+    archived_entries = []  # (key, endpoint, source_list, index)
+    for i, k in enumerate(config.get('archive', [])):
+        ep = k.get('endpoint', 'cn')
+        archived_entries.append((k['key'], ep, 'archive', i))
+    for ep in ('cn', 'sgp'):
+        for i, k in enumerate(config.get('archived', {}).get(ep, [])):
+            archived_entries.append((k['key'], ep, f'archived.{ep}', i))
+
+    if not archived_entries:
+        print("归档为空，无需刷新")
+        return
+
+    # 按 key 去重
+    seen = set()
+    unique = []
+    for key, ep, src, idx in archived_entries:
+        if key not in seen and key not in active_keys:
+            seen.add(key)
+            unique.append((key, ep, src, idx))
+
+    print(f"探测 {len(unique)} 个归档 key...\n")
+
+    # 批量探测
+    async with ClientSession() as session:
+        async def probe_one(key, ep):
+            url = endpoints.get(ep)
+            if not url:
+                return key, ep, -1, ''
+            code, body = await probe_key(session, key, url)
+            return key, ep, code, body
+
+        results = []
+        batch_size = 20
+        for i in range(0, len(unique), batch_size):
+            batch = unique[i:i + batch_size]
+            batch_results = await asyncio.gather(*(probe_one(k, e) for k, e, _, _ in batch))
+            results.extend(batch_results)
+            done = min(i + batch_size, len(unique))
+            print(f"  已探测 {done}/{len(unique)}")
+
+    # 分类结果
+    recovered = [(k, e) for k, e, c, _ in results if c == 200]
+    still_bad = {}
+    for k, e, c, b in results:
+        if c != 200:
+            status = code_to_status(c, b) or 'error'
+            still_bad[k] = (c, status)
+
+    if not recovered:
+        print("\n没有恢复的 key")
+        still_429 = sum(1 for c, s in still_bad.values() if s == 'quota_exhausted')
+        rate_limited = sum(1 for c, s in still_bad.values() if s == 'rate_limited')
+        invalid = sum(1 for c, s in still_bad.values() if s == 'invalid')
+        print(f"仍然 429(quota): {still_429}  限流: {rate_limited}  无效: {invalid}")
+        return
+
+    print(f"\n恢复 {len(recovered)} 个 key:")
+
+    # 执行迁移：从归档移出，加入 apikeys
+    recovered_set = {k for k, _ in recovered}
+    # key → endpoint 映射
+    recovered_ep = {k: e for k, e in recovered}
+
+    moved = 0
+    # 从 archive (flat) 移出
+    new_archive = []
+    for k in config.get('archive', []):
+        if k['key'] in recovered_set:
+            ep = recovered_ep[k['key']]
+            k['status'] = 'valid'
+            k.pop('error_code', None)
+            k.pop('error_message', None)
+            k.pop('archived_at', None)
+            config.setdefault('apikeys', {}).setdefault(ep, []).append(k)
+            if k['key'] not in active_keys:
+                active_keys.add(k['key'])
+                moved += 1
+                print(f"  + {k['key'][:24]}... -> {ep} (from archive)")
+        elif k['key'] in still_bad:
+            code, status = still_bad[k['key']]
+            k['status'] = status
+            k['error_code'] = code
+        else:
+            new_archive.append(k)
+    config['archive'] = new_archive
+
+    # 从 archived.cn/sgp 移出
+    for ep in ('cn', 'sgp'):
+        new_ep = []
+        for k in config.get('archived', {}).get(ep, []):
+            if k['key'] in recovered_set:
+                k['status'] = 'valid'
+                k.pop('error_code', None)
+                k.pop('error_message', None)
+                k.pop('archived_at', None)
+                config.setdefault('apikeys', {}).setdefault(ep, []).append(k)
+                if k['key'] not in active_keys:
+                    active_keys.add(k['key'])
+                    moved += 1
+                    print(f"  + {k['key'][:24]}... -> {ep} (from archived.{ep})")
+            elif k['key'] in still_bad:
+                code, status = still_bad[k['key']]
+                k['status'] = status
+                k['error_code'] = code
+                new_ep.append(k)
+            else:
+                new_ep.append(k)
+        config['archived'][ep] = new_ep
+
+    save_config(config)
+
+    # 汇总
+    total_active = sum(len(v) for v in config.get('apikeys', {}).values())
+    total_archived = len(config.get('archive', []))
+    for ep in ('cn', 'sgp'):
+        total_archived += len(config.get('archived', {}).get(ep, []))
+    print(f"\n移回活跃: {moved} 个，当前活跃: {total_active}，归档: {total_archived}")
+
+
 def cmd_archive(args):
     """将 invalid/quota_exhausted 的 key 移入归档"""
     config = load_config()
@@ -232,6 +383,8 @@ def main():
     p_archive = sub.add_parser('archive', help='归档失效key')
     p_archive.add_argument('--check', '-c', action='store_true', help='归档前先检测所有key')
 
+    p_refresh = sub.add_parser('refresh', help='重新探测归档key，恢复可用的')
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -246,6 +399,8 @@ def main():
         if args.check:
             asyncio.run(cmd_check(args))
         cmd_archive(args)
+    elif args.command == 'refresh':
+        asyncio.run(cmd_refresh(args))
 
 
 if __name__ == '__main__':

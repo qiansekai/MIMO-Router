@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector
-from mimo_core import CONFIG_PATH, load_config, probe_key, code_to_status, update_key_status, get_model_fallback
+from mimo_core import CONFIG_PATH, load_config, save_config, probe_key, code_to_status, update_key_status, get_model_fallback
 
 warnings.filterwarnings('ignore', message='Unclosed client session')
 warnings.filterwarnings('ignore', message='Unclosed connector')
@@ -72,6 +72,7 @@ class MimoRoute:
         self._endpoint_down: dict[str, float] = {}  # endpoint_url -> last 404 time
         self._endpoint_cooldown = 10.0  # 404 后冷却秒数
         self._endpoint_404_count: dict[str, int] = {}  # endpoint_url -> 404 次数
+        self._archived_refresh_interval = 600.0  # 归档 key 刷新间隔（10 分钟）
         self._max_retries = 3  # 最大重试次数
 
     async def _get_session(self) -> ClientSession:
@@ -89,8 +90,9 @@ class MimoRoute:
             config = load_config()
             cn_total = len(config['apikeys'].get('cn', []))
             sgp_total = len(config['apikeys'].get('sgp', []))
-            cn_valid = sum(1 for k in config['apikeys'].get('cn', []) if isinstance(k, dict) and k.get('status') not in ('invalid', 'disabled', 'quota_exhausted', 'error'))
-            sgp_valid = sum(1 for k in config['apikeys'].get('sgp', []) if isinstance(k, dict) and k.get('status') not in ('invalid', 'disabled', 'quota_exhausted', 'error'))
+            _unusable = ('invalid', 'disabled', 'quota_exhausted', 'rate_limited', 'error')
+            cn_valid = sum(1 for k in config['apikeys'].get('cn', []) if isinstance(k, dict) and k.get('status') not in _unusable)
+            sgp_valid = sum(1 for k in config['apikeys'].get('sgp', []) if isinstance(k, dict) and k.get('status') not in _unusable)
             logger.info(f"配置加载成功，cn: {cn_valid}/{cn_total}可用，sgp: {sgp_valid}/{sgp_total}可用，共 {cn_valid+sgp_valid} 个可用")
             return config
         except Exception as e:
@@ -128,20 +130,21 @@ class MimoRoute:
                 if not isinstance(k, dict):
                     continue
                 entry = {'endpoint': endpoint, 'key': k['key'], 'status': k.get('status', 'valid')}
-                if k.get('status') in ('invalid', 'quota_exhausted'):
+                status = k.get('status', 'valid')
+                if status in ('invalid', 'quota_exhausted', 'rate_limited'):
                     recovery.append(entry)
-                elif k.get('status') not in ('disabled', 'error'):
+                elif status not in ('disabled', 'error'):
                     valid.append(entry)
         self._cached_keys = (valid, recovery)
         return valid, recovery
 
-    def _invalidate_key(self, key: str, endpoint: str, error_code: int, error_message: str):
+    def _invalidate_key(self, key: str, endpoint: str, error_code: int, error_message: str, status: str = 'invalid'):
         """标记 key 失效，线程池执行"""
         loop = asyncio.get_running_loop()
-        loop.run_in_executor(None, self._invalidate_key_sync, key, endpoint, error_code, error_message)
+        loop.run_in_executor(None, self._invalidate_key_sync, key, endpoint, error_code, error_message, status)
 
-    def _invalidate_key_sync(self, key: str, endpoint: str, error_code: int, error_message: str):
-        changed, config = update_key_status(key, 'invalid', error_code, error_message)
+    def _invalidate_key_sync(self, key: str, endpoint: str, error_code: int, error_message: str, status: str = 'invalid'):
+        changed, config = update_key_status(key, status, error_code, error_message)
         if changed and config:
             logger.warning(f"key {key[:16]}... 已失效 (endpoint: {endpoint}, code: {error_code})")
             self.config = config
@@ -208,8 +211,9 @@ class MimoRoute:
                     logger.info(f"key={key[:8]}... endpoint={endpoint_url} status={resp.status} latency={latency}ms error={error_body} anthropic-version={api_ver}")
 
                     if resp.status in (401, 402, 403, 429):
-                        self._invalidate_key(key, endpoint_url, resp.status, error_body)
-                        self._last_error_permanent = True
+                        status = code_to_status(resp.status, error_body) or 'invalid'
+                        self._invalidate_key(key, endpoint_url, resp.status, error_body, status)
+                        self._last_error_permanent = (status != 'rate_limited')
                     else:
                         self._last_error_permanent = False
                         if resp.status == 404:
@@ -285,15 +289,120 @@ class MimoRoute:
             self._last_cn_valid = cn_valid
             self._last_sgp_valid = sgp_valid
 
+    async def _refresh_archived(self):
+        """探测归档 key，恢复可用的到活跃列表"""
+        config = load_config()
+        endpoints = config.get('endpoints', {})
+
+        # 已在活跃列表的 key
+        active_keys = set()
+        for key_list in config.get('apikeys', {}).values():
+            for k in key_list:
+                if isinstance(k, dict):
+                    active_keys.add(k['key'])
+
+        # 收集归档 key
+        to_probe = []  # (key, endpoint)
+        for k in config.get('archive', []):
+            ep = k.get('endpoint', 'cn')
+            if k['key'] not in active_keys:
+                to_probe.append((k['key'], ep))
+        for ep in ('cn', 'sgp'):
+            for k in config.get('archived', {}).get(ep, []):
+                if k['key'] not in active_keys:
+                    to_probe.append((k['key'], ep))
+
+        if not to_probe:
+            return
+
+        # 去重
+        seen = set()
+        unique = []
+        for key, ep in to_probe:
+            if key not in seen:
+                seen.add(key)
+                unique.append((key, ep))
+
+        session = await self._get_session()
+
+        async def probe(key, ep):
+            url = endpoints.get(ep)
+            if not url:
+                return key, ep, -1, ''
+            code, body = await probe_key(session, key, url)
+            return key, ep, code, body
+
+        results = await asyncio.gather(*(probe(k, e) for k, e in unique))
+        recovered = {k: e for k, e, c, _ in results if c == 200}
+
+        if not recovered:
+            return
+
+        # 重新加载配置，执行迁移
+        config = load_config()
+        active_keys = set()
+        for key_list in config.get('apikeys', {}).values():
+            for k in key_list:
+                if isinstance(k, dict):
+                    active_keys.add(k['key'])
+
+        moved = 0
+        # 从 archive 移出
+        new_archive = []
+        for k in config.get('archive', []):
+            if k['key'] in recovered and k['key'] not in active_keys:
+                ep = recovered[k['key']]
+                k['status'] = 'valid'
+                k.pop('error_code', None)
+                k.pop('error_message', None)
+                k.pop('archived_at', None)
+                config.setdefault('apikeys', {}).setdefault(ep, []).append(k)
+                active_keys.add(k['key'])
+                moved += 1
+            else:
+                new_archive.append(k)
+        config['archive'] = new_archive
+
+        # 从 archived.cn/sgp 移出
+        for ep in ('cn', 'sgp'):
+            new_ep = []
+            for k in config.get('archived', {}).get(ep, []):
+                if k['key'] in recovered and k['key'] not in active_keys:
+                    k['status'] = 'valid'
+                    k.pop('error_code', None)
+                    k.pop('error_message', None)
+                    k.pop('archived_at', None)
+                    config.setdefault('apikeys', {}).setdefault(ep, []).append(k)
+                    active_keys.add(k['key'])
+                    moved += 1
+                else:
+                    new_ep.append(k)
+            config['archived'][ep] = new_ep
+
+        if moved > 0:
+            save_config(config)
+            self.config = config
+            self._invalidate_config_cache()
+            logger.info(f"归档刷新: 恢复 {moved} 个 key 到活跃列表")
+
     async def _background_refresh(self, app: web.Application):
-        """启动时立即刷新，之后每 30 秒轮询"""
+        """启动时立即刷新，之后每 30 秒轮询活跃 key，每 10 分钟轮询归档 key"""
         await self._refresh_keys()
+        last_archived_refresh = 0.0
         while True:
             await asyncio.sleep(30)
             try:
                 await self._refresh_keys()
             except Exception as e:
                 logger.error(f"后台刷新异常: {e}")
+
+            now = time.monotonic()
+            if now - last_archived_refresh >= self._archived_refresh_interval:
+                last_archived_refresh = now
+                try:
+                    await self._refresh_archived()
+                except Exception as e:
+                    logger.error(f"归档刷新异常: {e}")
 
     async def handle_request(self, request: web.Request):
         if request.method == 'OPTIONS':
@@ -436,8 +545,6 @@ class MimoRoute:
                     wait_time = min(2.0 * retry_count, 10.0)  # 递增等待，最多 10 秒
                     logger.info(f"本轮所有 key 失败，等待 {wait_time}s 后重试 ({retry_count}/{self._max_retries})")
                     await asyncio.sleep(wait_time)
-                    # 重置端点冷却，允许重试
-                    self._endpoint_down.clear()
 
         # 所有模型和重试都失败，尝试 recovery keys
         for info in recovery_keys:

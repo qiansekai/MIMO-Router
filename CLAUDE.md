@@ -52,6 +52,7 @@ python mimo-keys.py import tp-xxxxx                       # 导入单个 key
 python mimo-keys.py import key1 key2 key3                 # 批量导入（并行检测）
 python mimo-keys.py import <base64字符串> --base64         # 强制 base64 解码（dHA 开头自动识别）
 python mimo-keys.py archive          # 归档失效 key
+python mimo-keys.py refresh          # 重新探测归档 key，恢复可用的到活跃列表
 ```
 
 ## 架构
@@ -61,9 +62,9 @@ python mimo-keys.py archive          # 归档失效 key
 1. **请求入口** — `handle_request` 接收所有 HTTP 请求，校验 `Authorization` 头中的 `local_key`
 2. **Key 选择** — round-robin 轮询所有可用 key，均匀分摊请求负载，失败自动跳下一个
 3. **请求转发** — `_forward` 流式代理到目标端点（SSE chunk-by-chunk），透传客户端原始 request/response header（仅替换 Authorization）
-4. **自动重试** — 非 200 响应按类型处理：401/403 标记 invalid，429+quota 标记 quota_exhausted，其余临时错误（404/429 限频等）不动状态
+4. **自动重试** — 非 200 响应按类型处理：401/403 标记 invalid 归档，429+quota 标记 quota_exhausted 归档，429 限流标记 rate_limited（临时，保留在列表），其余临时错误（404 等）不动状态
 5. **热更新** — 通过文件 mtime 监控 `config.json` 变更，无需重启（2 秒检查间隔）
-6. **后台刷新** — 每 30 秒探测所有 key 状态，恢复已修复的 key，仅在确定性失败时标记失效
+6. **后台刷新** — 每 30 秒探测活跃 key 状态，每 10 分钟探测归档 key，恢复可用的到活跃列表
 7. **端点冷却** — 404 响应触发 10 秒冷却期，避免向故障端点堆积请求
 8. **智能路由** — 检测到图片内容自动切换到 `mimo-v2.5` 模型，`-nothinking` 后缀自动转换为 `thinking: disabled`
 9. **404 智能重试** — 404 时跳过同端点 key，自动尝试其他端点，支持递增等待重试（最多 3 次）
@@ -80,9 +81,9 @@ python mimo-keys.py archive          # 归档失效 key
 
 ## Key 状态
 
-`valid` → 正常使用 | `invalid` → 失效（自动标记或手动） | `disabled` → 手动禁用 | `quota_exhausted` → 额度用尽
+`valid` → 正常使用 | `invalid` → 失效（自动标记或手动） | `disabled` → 手动禁用 | `quota_exhausted` → 额度用尽（归档） | `rate_limited` → 限流（临时，不归档）
 
-服务器只使用 `status=valid` 的 key。运行时按 round-robin 轮询，非 200 响应按类型判断是否标记失效（404 等临时错误不会误判）。
+服务器只使用 `status=valid` 的 key。运行时按 round-robin 轮询，非 200 响应按类型判断：429 区分额度耗尽（归档）和限流（临时，保留在列表中等恢复），401/403 归档，404 等临时错误不动状态。`refresh` 命令可重新探测归档 key，恢复可用的。
 
 ## 依赖
 
